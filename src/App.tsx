@@ -48,13 +48,15 @@ import {
   resolveApiUrl,
   resolveApiVersion,
 } from './utils/apiUrl';
-import { safeStorageSet } from './utils/storage';
+import { safeStorageGet, safeStorageSet } from './utils/storage';
 import { calculateSuccessRate, formatDuration } from './utils/stats';
 import { TASK_STATE_VERSION, saveTaskState, DEFAULT_TASK_STATS } from './components/imageTaskState';
 import {
   authBackend,
   clearBackendToken,
   deleteBackendTask,
+  fetchBackendProxyNodes,
+  fetchBackendProxySubscription,
   fetchBackendCollection,
   fetchBackendState,
   getBackendMode,
@@ -63,8 +65,10 @@ import {
   patchBackendState,
   putBackendTask,
   putBackendCollection,
+  selectBackendProxyNode,
   setBackendMode as persistBackendMode,
   setBackendToken,
+  updateBackendProxySubscription,
   type BackendState,
 } from './utils/backendApi';
 
@@ -78,6 +82,7 @@ const EMPTY_GLOBAL_STATS: GlobalStats = {
   totalTime: 0,
 };
 const API_FORMATS: ApiFormat[] = ['openai', 'gemini', 'vertex'];
+const PROXY_SUBSCRIPTION_KEY = 'moe-image-proxy-subscription';
 
 type FormatConfigMap = Record<ApiFormat, FormatConfig>;
 
@@ -130,6 +135,14 @@ function App() {
   const [backendAuthLoading, setBackendAuthLoading] = useState(false);
   const [backendSyncing, setBackendSyncing] = useState(false);
   const backendModeRef = useRef(initialBackendMode);
+  const [proxySubscription, setProxySubscription] = useState(
+    () => safeStorageGet(PROXY_SUBSCRIPTION_KEY) || '',
+  );
+  const [proxyNodes, setProxyNodes] = useState<Array<{ label: string; value: string }>>([]);
+  const [proxyNodesLoading, setProxyNodesLoading] = useState(false);
+  const [proxyNodeActive, setProxyNodeActive] = useState('');
+  const [proxyNodeSelecting, setProxyNodeSelecting] = useState(false);
+  const [proxySubscriptionLoading, setProxySubscriptionLoading] = useState(false);
   const configRef = useRef(config);
   const configVisibleRef = useRef(configVisible);
   const backendFormatConfigsRef = useRef<FormatConfigMap>(
@@ -152,6 +165,48 @@ function App() {
     backendMode && backendReadyRef.current
       ? { config, configByFormat: backendFormatConfigsRef.current }
       : null;
+
+  const parseProxyNodes = useCallback((data: Record<string, unknown>) => {
+    const proxies = data?.proxies as Record<string, any> | undefined;
+    const group = proxies?.Proxy;
+    if (!group) {
+      return { nodes: [], active: '' };
+    }
+    const nodes = Array.isArray(group.all)
+      ? group.all.map((name: string) => ({ label: name, value: name }))
+      : [];
+    const active = typeof group.now === 'string' ? group.now : '';
+    return { nodes, active };
+  }, []);
+
+  const refreshProxyNodes = useCallback(async () => {
+    if (!backendMode) return;
+    setProxyNodesLoading(true);
+    try {
+      const data = await fetchBackendProxyNodes();
+      const { nodes, active } = parseProxyNodes(data);
+      setProxyNodes(nodes);
+      setProxyNodeActive(active);
+    } catch (err) {
+      console.error(err);
+      message.error('代理节点列表获取失败');
+    } finally {
+      setProxyNodesLoading(false);
+    }
+  }, [backendMode, parseProxyNodes]);
+
+  const refreshProxySubscription = useCallback(async () => {
+    if (!backendMode) return;
+    try {
+      const data = await fetchBackendProxySubscription();
+      if (data?.url) {
+        setProxySubscription(data.url);
+        safeStorageSet(PROXY_SUBSCRIPTION_KEY, data.url, 'proxy subscription');
+      }
+    } catch (err) {
+      console.warn('Failed to load proxy subscription:', err);
+    }
+  }, [backendMode]);
   const syncBackendConfig = useCallback(
     (payload: { config: AppConfig; configByFormat: FormatConfigMap }) => {
       void patchBackendState(payload).catch((err) => {
@@ -325,9 +380,56 @@ function App() {
     setBackendPassword('');
   };
 
+  const handleProxySubscriptionSave = useCallback(async () => {
+    if (!backendMode) {
+      message.warning('请先启用后端模式');
+      return;
+    }
+    if (!proxySubscription) {
+      message.warning('请输入订阅链接');
+      return;
+    }
+    setProxySubscriptionLoading(true);
+    try {
+      await updateBackendProxySubscription(proxySubscription);
+      safeStorageSet(PROXY_SUBSCRIPTION_KEY, proxySubscription, 'proxy subscription');
+      message.success('订阅已更新');
+      await refreshProxyNodes();
+    } catch (err) {
+      console.error(err);
+      message.error('订阅更新失败');
+    } finally {
+      setProxySubscriptionLoading(false);
+    }
+  }, [backendMode, proxySubscription, refreshProxyNodes]);
+
+  const handleProxyNodeSelect = useCallback(
+    async (nodeName: string) => {
+      if (!backendMode) return;
+      setProxyNodeSelecting(true);
+      try {
+        await selectBackendProxyNode('Proxy', nodeName);
+        setProxyNodeActive(nodeName);
+        message.success(`已切换节点：${nodeName}`);
+      } catch (err) {
+        console.error(err);
+        message.error('节点切换失败');
+      } finally {
+        setProxyNodeSelecting(false);
+      }
+    },
+    [backendMode],
+  );
+
   React.useEffect(() => {
     backendModeRef.current = backendMode;
   }, [backendMode]);
+
+  React.useEffect(() => {
+    if (!backendMode) return;
+    void refreshProxySubscription();
+    void refreshProxyNodes();
+  }, [backendMode, refreshProxyNodes, refreshProxySubscription]);
 
   React.useEffect(() => {
     configRef.current = config;
@@ -1302,6 +1404,16 @@ function App() {
           onBackendDisable={handleBackendDisable}
           onBackendAuthCancel={handleBackendAuthCancel}
           onBackendAuthConfirm={handleBackendAuthConfirm}
+          proxySubscription={proxySubscription}
+          proxySubscriptionLoading={proxySubscriptionLoading}
+          onProxySubscriptionChange={setProxySubscription}
+          onProxySubscriptionSave={handleProxySubscriptionSave}
+          proxyNodes={proxyNodes}
+          proxyNodesLoading={proxyNodesLoading}
+          proxyNodeActive={proxyNodeActive}
+          proxyNodeSelecting={proxyNodeSelecting}
+          onProxyNodesRefresh={refreshProxyNodes}
+          onProxyNodeSelect={handleProxyNodeSelect}
         />
 
       </Layout>
@@ -1310,4 +1422,3 @@ function App() {
 }
 
 export default App;
-

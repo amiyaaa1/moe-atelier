@@ -68,6 +68,16 @@ BACKEND_LOG_RESPONSE=0
 - `BACKEND_LOG_REQUESTS`：打印请求日志（`1/true/yes` 开启）。
 - `BACKEND_LOG_OUTBOUND`：打印后端到模型服务的请求日志。
 - `BACKEND_LOG_RESPONSE`：打印模型响应（会截断长内容）。
+- `BACKEND_PROXY_URL`：为后端模式强制指定代理（支持 `http://`/`https://`/`socks5://`），例如 `http://127.0.0.1:7890` 或 `socks5://127.0.0.1:7891`。
+- `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY`：如果未设置 `BACKEND_PROXY_URL`，后端请求会遵循这些环境变量。
+- `BACKEND_PROXY_CORE`：内置代理内核类型（目前支持 `clash`，为空则不启用）。
+- `BACKEND_PROXY_CORE_PATH`：Clash/Mihomo 核心二进制路径，例如 `/app/bin/mihomo`。
+- `BACKEND_PROXY_SUBSCRIPTION_URL`：Clash 订阅地址（用于自动拉取节点）。
+- `BACKEND_PROXY_CONTROLLER_PORT`：Clash 控制端口（默认 `9090`）。
+- `BACKEND_PROXY_CONTROLLER_SECRET`：Clash 控制端口密钥（可选）。
+- `BACKEND_PROXY_HTTP_PORT`：Clash HTTP 代理端口（默认 `7890`）。
+- `BACKEND_PROXY_SOCKS_PORT`：Clash SOCKS5 代理端口（默认 `7891`）。
+- `BACKEND_PROXY_NODE`：启动时自动选择的节点名称（默认使用 Proxy 组）。
 - `PORT`：服务监听端口，默认 `5173`。
 - `VITE_HOST`：开发模式下的 Vite Host，外网访问时可设为 `0.0.0.0`。
 
@@ -95,6 +105,26 @@ npm run start
 PORT=8080 npm run start
 ```
 如果用 Nginx/Caddy 反代到公网，请保证 HTTPS（因为要在浏览器里填写 API Key），并确保你的 OpenAI 兼容服务允许跨域访问。
+
+## 代理与 Clash 订阅
+- 后端模式支持直接走 SOCKS5/HTTP 代理：在 VPS 上配置好代理服务后，设置 `BACKEND_PROXY_URL` 即可。
+- 如需使用 Clash 机场订阅，请在 VPS 上运行 Clash/Mihomo（导入订阅后会提供本地 `HTTP`/`SOCKS5` 端口），再将 `BACKEND_PROXY_URL` 指向该端口即可。
+
+### 内置 Clash 代理内核（无需单独运行 Clash）
+1) 在服务器上准备 Clash/Mihomo 二进制（例如下载 `mihomo`），并设置：
+```bash
+BACKEND_PROXY_CORE=clash
+BACKEND_PROXY_CORE_PATH=/app/bin/mihomo
+BACKEND_PROXY_SUBSCRIPTION_URL=你的clash订阅链接
+```
+2) 启动服务后，后端会自动启动内置 Clash，并将所有外部请求通过 `socks5://127.0.0.1:7891` 转发。
+3) 选择节点（需要启用后端模式并先登录）：
+```bash
+curl -H "x-backend-token: <token>" http://localhost:5173/api/backend/proxy/nodes
+curl -H "x-backend-token: <token>" -H "Content-Type: application/json" \
+  -X POST http://localhost:5173/api/backend/proxy/select \
+  -d '{"group":"Proxy","name":"节点名称"}'
+```
 
 ## 目录结构
 - `src/`：前端源码
