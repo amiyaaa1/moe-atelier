@@ -1,7 +1,12 @@
 ﻿import express from 'express'
 import crypto from 'node:crypto'
+import { spawn } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
+import fetchNode from 'node-fetch'
+import { SocksProxyAgent } from 'socks-proxy-agent'
+import { ProxyAgent } from 'undici'
+import { getProxyForUrl } from 'proxy-from-env'
 import {
   backendImagesDir,
   backendLogRequests,
@@ -11,6 +16,7 @@ import {
   isProd,
   port,
   rootDir,
+  serverDataDir,
   DEFAULT_BACKEND_CONFIG,
   DEFAULT_CONCURRENCY,
   DEFAULT_GLOBAL_STATS,
@@ -50,6 +56,63 @@ const RETRY_DELAY_MS = 1000
 const ORPHAN_CLEANUP_DELAY_MS = 1500
 
 let orphanCleanupTimer = null
+const proxyAgentCache = new Map()
+const proxyCoreType = String(process.env.BACKEND_PROXY_CORE || '').toLowerCase()
+let proxySubscriptionUrl = process.env.BACKEND_PROXY_SUBSCRIPTION_URL || ''
+const proxyCorePath = process.env.BACKEND_PROXY_CORE_PATH || ''
+const proxyControllerSecret = process.env.BACKEND_PROXY_CONTROLLER_SECRET || ''
+const proxyControllerPort = Number(process.env.BACKEND_PROXY_CONTROLLER_PORT) || 9090
+const proxyHttpPort = Number(process.env.BACKEND_PROXY_HTTP_PORT) || 7890
+const proxySocksPort = Number(process.env.BACKEND_PROXY_SOCKS_PORT) || 7891
+const proxyNodeName = process.env.BACKEND_PROXY_NODE || ''
+const proxyConfigDir = path.join(serverDataDir, 'proxy-core')
+const proxyConfigPath =
+  process.env.BACKEND_PROXY_CONFIG_PATH || path.join(proxyConfigDir, 'clash.yaml')
+const proxyProviderPath = path.join(proxyConfigDir, 'provider.yaml')
+let proxyCoreProcess = null
+
+const resolveProxyUrl = (url) => {
+  if (!url) return ''
+  if (process.env.BACKEND_PROXY_URL) return process.env.BACKEND_PROXY_URL
+  if (proxyCoreType === 'clash') {
+    return `socks5://127.0.0.1:${proxySocksPort}`
+  }
+  return getProxyForUrl(url) || ''
+}
+
+const isSocksProxy = (proxyUrl) => /^socks5h?:\/\//i.test(proxyUrl) || /^socks:\/\//i.test(proxyUrl)
+
+const getProxyDispatcher = (proxyUrl) => {
+  if (!proxyUrl || isSocksProxy(proxyUrl)) return undefined
+  let agent = proxyAgentCache.get(proxyUrl)
+  if (!agent) {
+    agent = new ProxyAgent(proxyUrl)
+    proxyAgentCache.set(proxyUrl, agent)
+  }
+  return agent
+}
+
+const getSocksAgent = (proxyUrl) => {
+  if (!proxyUrl || !isSocksProxy(proxyUrl)) return undefined
+  let agent = proxyAgentCache.get(proxyUrl)
+  if (!agent) {
+    agent = new SocksProxyAgent(proxyUrl)
+    proxyAgentCache.set(proxyUrl, agent)
+  }
+  return agent
+}
+
+const fetchWithProxy = (url, options = {}) => {
+  const proxyUrl = resolveProxyUrl(url)
+  if (!proxyUrl) return fetch(url, options)
+  const socksAgent = getSocksAgent(proxyUrl)
+  if (socksAgent) {
+    return fetchNode(url, { ...options, agent: socksAgent })
+  }
+  const dispatcher = getProxyDispatcher(proxyUrl)
+  if (!dispatcher) return fetch(url, options)
+  return fetch(url, { ...options, dispatcher })
+}
 
 const collectImageKeysFromTask = (taskState) => {
   const keys = new Set()
@@ -511,48 +574,194 @@ const buildGeminiRequest = (config) => {
   return { url, headers }
 }
 
-const readGeminiStream = async (response) => {
-  const reader = response.body?.getReader()
-  if (!reader) {
-    return response.json()
-  }
+const consumeResponseLines = async (body, onLine) => {
+  if (!body) return
   const decoder = new TextDecoder()
   let buffer = ''
-  let lastJson = null
 
-  while (true) {
-    const { value, done } = await reader.read()
-    if (done) break
-    buffer += decoder.decode(value, { stream: true })
+  const flushBuffer = () => {
     let newlineIndex = buffer.indexOf('\n')
     while (newlineIndex >= 0) {
-      const line = buffer.slice(0, newlineIndex).trim()
+      const line = buffer.slice(0, newlineIndex)
       buffer = buffer.slice(newlineIndex + 1)
+      onLine(line)
       newlineIndex = buffer.indexOf('\n')
-      if (!line) continue
-      const cleaned = line.replace(/^data:\s*/i, '').trim()
-      if (!cleaned || cleaned === '[DONE]') continue
-      try {
-        lastJson = JSON.parse(cleaned)
-      } catch {
-        // ignore
+    }
+  }
+
+  if (typeof body.getReader === 'function') {
+    const reader = body.getReader()
+    while (true) {
+      const { value, done } = await reader.read()
+      if (done) break
+      if (value) {
+        buffer += decoder.decode(value, { stream: true })
+        flushBuffer()
       }
+    }
+  } else if (body[Symbol.asyncIterator]) {
+    for await (const chunk of body) {
+      if (!chunk) continue
+      buffer += decoder.decode(chunk, { stream: true })
+      flushBuffer()
     }
   }
 
   const tail = decoder.decode()
   if (tail) buffer += tail
-  const remainder = buffer.trim()
-  if (remainder) {
-    const cleaned = remainder.replace(/^data:\s*/i, '').trim()
-    if (cleaned && cleaned !== '[DONE]') {
-      try {
-        lastJson = JSON.parse(cleaned)
-      } catch {
-        // ignore
-      }
+  if (buffer) onLine(buffer)
+}
+
+const buildClashConfig = () => {
+  const controller =
+    proxyControllerPort > 0 ? `127.0.0.1:${proxyControllerPort}` : '127.0.0.1:9090'
+  const safeHttpPort = Number.isFinite(proxyHttpPort) ? proxyHttpPort : 7890
+  const safeSocksPort = Number.isFinite(proxySocksPort) ? proxySocksPort : 7891
+  const lines = [
+    'mode: rule',
+    'log-level: info',
+    `port: ${safeHttpPort}`,
+    `socks-port: ${safeSocksPort}`,
+    'allow-lan: false',
+    `external-controller: ${controller}`,
+  ]
+  if (proxyControllerSecret) {
+    lines.push(`secret: "${proxyControllerSecret}"`)
+  }
+  lines.push(
+    'proxy-providers:',
+    '  subscription:',
+    '    type: http',
+    `    url: "${proxySubscriptionUrl}"`,
+    '    interval: 3600',
+    `    path: "${proxyProviderPath}"`,
+    '    health-check:',
+    '      enable: true',
+    '      url: "http://www.gstatic.com/generate_204"',
+    '      interval: 600',
+    'proxy-groups:',
+    '  - name: Proxy',
+    '    type: select',
+    '    use:',
+    '      - subscription',
+    '  - name: Auto',
+    '    type: url-test',
+    '    use:',
+    '      - subscription',
+    '    url: "http://www.gstatic.com/generate_204"',
+    '    interval: 300',
+    'rules:',
+    '  - MATCH,Proxy',
+  )
+  return lines.join('\n')
+}
+
+const ensureProxyConfig = async () => {
+  if (!proxySubscriptionUrl) {
+    throw new Error('BACKEND_PROXY_SUBSCRIPTION_URL not set')
+  }
+  await fs.promises.mkdir(proxyConfigDir, { recursive: true })
+  const config = buildClashConfig()
+  await fs.promises.writeFile(proxyConfigPath, config, 'utf-8')
+}
+
+const startProxyCore = async () => {
+  if (proxyCoreType !== 'clash') return
+  if (!proxyCorePath) {
+    console.warn('BACKEND_PROXY_CORE_PATH not set, skip proxy core start')
+    return
+  }
+  if (!fs.existsSync(proxyCorePath)) {
+    console.warn('Proxy core binary not found:', proxyCorePath)
+    return
+  }
+  if (!proxySubscriptionUrl) {
+    console.warn('BACKEND_PROXY_SUBSCRIPTION_URL not set, skip proxy core start')
+    return
+  }
+  if (proxyCoreProcess) return
+  await ensureProxyConfig()
+  proxyCoreProcess = spawn(proxyCorePath, ['-f', proxyConfigPath], {
+    stdio: 'inherit',
+  })
+  proxyCoreProcess.on('exit', (code, signal) => {
+    console.warn('proxy core exited', { code, signal })
+    proxyCoreProcess = null
+  })
+}
+
+const stopProxyCore = () => {
+  if (!proxyCoreProcess) return
+  proxyCoreProcess.kill('SIGTERM')
+  proxyCoreProcess = null
+}
+
+const restartProxyCore = async () => {
+  stopProxyCore()
+  await startProxyCore()
+  await trySelectProxyNode()
+}
+
+const requestProxyController = async (path, options = {}) => {
+  const base = `http://127.0.0.1:${proxyControllerPort}`
+  const headers = {
+    Accept: 'application/json',
+    ...(options.headers || {}),
+  }
+  if (proxyControllerSecret) {
+    headers.Authorization = `Bearer ${proxyControllerSecret}`
+  }
+  const response = await fetchNode(`${base}${path}`, {
+    ...options,
+    headers,
+  })
+  if (!response.ok) {
+    const text = await response.text()
+    throw new Error(text || response.statusText)
+  }
+  if (response.status === 204) return null
+  return response.json()
+}
+
+const selectProxyNode = async (groupName, nodeName) => {
+  if (!groupName || !nodeName) return
+  await requestProxyController(`/proxies/${encodeURIComponent(groupName)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: nodeName }),
+  })
+}
+
+const trySelectProxyNode = async () => {
+  if (!proxyNodeName) return
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    try {
+      await selectProxyNode('Proxy', proxyNodeName)
+      return
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 500))
     }
   }
+}
+
+const readGeminiStream = async (response) => {
+  const body = response.body
+  if (!body) {
+    return response.json()
+  }
+  let lastJson = null
+
+  await consumeResponseLines(body, (rawLine) => {
+    const line = rawLine.trim()
+    if (!line) return
+    const cleaned = line.replace(/^data:\s*/i, '').trim()
+    if (!cleaned || cleaned === '[DONE]') return
+    try {
+      lastJson = JSON.parse(cleaned)
+    } catch {
+      // ignore
+    }
+  })
 
   return lastJson
 }
@@ -598,7 +807,7 @@ const requestImageUrl = async (config, messages, signal) => {
       const built = buildGeminiRequest(config)
       requestInfo.url = built.url
       logBackendOutbound('api-request', requestInfo)
-      response = await fetch(built.url, {
+      response = await fetchWithProxy(built.url, {
         method: 'POST',
         headers: built.headers,
         body: JSON.stringify({ contents }),
@@ -656,7 +865,7 @@ const requestImageUrl = async (config, messages, signal) => {
     logBackendOutbound('api-request', requestInfo)
     let response
     try {
-      response = await fetch(requestInfo.url, {
+      response = await fetchWithProxy(requestInfo.url, {
         method: 'POST',
         headers,
         body: JSON.stringify({ model: config.model, messages, stream: true }),
@@ -675,10 +884,7 @@ const requestImageUrl = async (config, messages, signal) => {
       logBackendResponse('stream-error', { status: response.status, message })
       throw new Error(message)
     }
-    const reader = response.body?.getReader()
-    const decoder = new TextDecoder()
     let generatedText = ''
-    let pending = ''
     const consumeLine = (line) => {
       const cleaned = line.replace(/\r$/, '')
       if (!cleaned.startsWith('data:')) return
@@ -693,25 +899,7 @@ const requestImageUrl = async (config, messages, signal) => {
         // ignore chunk parse errors
       }
     }
-    if (reader) {
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        pending += decoder.decode(value, { stream: true })
-        let newlineIndex = pending.indexOf('\n')
-        while (newlineIndex >= 0) {
-          const line = pending.slice(0, newlineIndex)
-          pending = pending.slice(newlineIndex + 1)
-          consumeLine(line)
-          newlineIndex = pending.indexOf('\n')
-        }
-      }
-      const tail = decoder.decode()
-      if (tail) pending += tail
-    }
-    if (pending) {
-      consumeLine(pending)
-    }
+    await consumeResponseLines(response.body, consumeLine)
     const imageUrl = parseMarkdownImage(generatedText)
     if (!imageUrl) {
       logBackendResponse('stream-response', generatedText)
@@ -727,7 +915,7 @@ const requestImageUrl = async (config, messages, signal) => {
   logBackendOutbound('api-request', requestInfo)
   let response
   try {
-    response = await fetch(requestInfo.url, {
+    response = await fetchWithProxy(requestInfo.url, {
       method: 'POST',
       headers,
       body: JSON.stringify({ model: config.model, messages, stream: false }),
@@ -766,7 +954,7 @@ const downloadImageBuffer = async (imageUrl) => {
   }
   let response
   try {
-    response = await fetch(imageUrl, { headers: { Connection: 'close' } })
+    response = await fetchWithProxy(imageUrl, { headers: { Connection: 'close' } })
   } catch (err) {
     logBackendOutbound('image-download-error', {
       url: imageUrl,
@@ -1079,12 +1267,21 @@ void cleanupOrphanedImages().catch((err) => {
   console.warn('启动时清理后端图片缓存失败:', err)
 })
 
+void startProxyCore()
+  .then(() => trySelectProxyNode())
+  .catch((err) => {
+    console.warn('启动代理内核失败:', err)
+  })
+
+process.on('SIGINT', stopProxyCore)
+process.on('SIGTERM', stopProxyCore)
+
 const backendTokens = new Set()
 const PROMPT_MANAGER_URL = 'https://prompt.vioaki.xyz/api/gallery'
 
 app.get('/api/prompt-manager', async (_req, res) => {
   try {
-    const response = await fetch(PROMPT_MANAGER_URL, {
+    const response = await fetchWithProxy(PROMPT_MANAGER_URL, {
       headers: { Accept: 'application/json', Connection: 'close' },
     })
     if (!response.ok) {
@@ -1113,6 +1310,26 @@ const requireBackendAuth = (req, res, next) => {
   next()
 }
 
+const ensureProxyControllerReady = (res) => {
+  if (proxyCoreType !== 'clash') {
+    res.status(400).json({ error: 'Proxy core not enabled' })
+    return false
+  }
+  if (!proxySubscriptionUrl) {
+    res.status(400).json({ error: 'Proxy subscription not configured' })
+    return false
+  }
+  return true
+}
+
+const ensureProxyCoreEnabled = (res) => {
+  if (proxyCoreType !== 'clash') {
+    res.status(400).json({ error: 'Proxy core not enabled' })
+    return false
+  }
+  return true
+}
+
 app.post('/api/backend/auth', async (req, res) => {
   if (!backendPassword) {
     res.status(500).json({ error: 'BACKEND_PASSWORD not set' })
@@ -1126,6 +1343,60 @@ app.post('/api/backend/auth', async (req, res) => {
   const token = crypto.randomBytes(16).toString('hex')
   backendTokens.add(token)
   res.json({ token })
+})
+
+app.get('/api/backend/proxy/subscription', requireBackendAuth, async (_req, res) => {
+  if (!ensureProxyCoreEnabled(res)) return
+  res.json({ url: proxySubscriptionUrl })
+})
+
+app.post('/api/backend/proxy/subscription', requireBackendAuth, async (req, res) => {
+  if (!ensureProxyCoreEnabled(res)) return
+  const { url } = req.body || {}
+  if (!url || typeof url !== 'string') {
+    res.status(400).json({ error: 'Subscription URL required' })
+    return
+  }
+  if (!/^https?:\/\//i.test(url)) {
+    res.status(400).json({ error: 'Subscription URL must be http(s)' })
+    return
+  }
+  try {
+    proxySubscriptionUrl = url.trim()
+    await ensureProxyConfig()
+    await restartProxyCore()
+    res.json({ ok: true })
+  } catch (err) {
+    console.error('proxy subscription update error:', err)
+    res.status(500).json({ error: 'Proxy subscription update failed' })
+  }
+})
+
+app.get('/api/backend/proxy/nodes', requireBackendAuth, async (_req, res) => {
+  if (!ensureProxyControllerReady(res)) return
+  try {
+    const data = await requestProxyController('/proxies')
+    res.json(data)
+  } catch (err) {
+    console.error('proxy node list error:', err)
+    res.status(500).json({ error: 'Proxy controller error' })
+  }
+})
+
+app.post('/api/backend/proxy/select', requireBackendAuth, async (req, res) => {
+  if (!ensureProxyControllerReady(res)) return
+  const { group = 'Proxy', name } = req.body || {}
+  if (!name) {
+    res.status(400).json({ error: 'Node name required' })
+    return
+  }
+  try {
+    await selectProxyNode(group, name)
+    res.json({ ok: true })
+  } catch (err) {
+    console.error('proxy node select error:', err)
+    res.status(500).json({ error: 'Proxy controller error' })
+  }
 })
 
 app.get('/api/backend/stream', requireBackendAuth, async (req, res) => {
@@ -1489,5 +1760,3 @@ if (isProd) {
 app.listen(port, () => {
   console.log(`[server] http://localhost:${port} (${isProd ? 'prod' : 'dev'})`)
 })
-
-

@@ -100,6 +100,24 @@ export const patchBackendState = async (payload: Partial<BackendState>) =>
 export const fetchBackendCollection = async () =>
   backendJson<CollectionItem[]>('/api/backend/collection');
 
+export const fetchBackendProxySubscription = async () =>
+  backendJson<{ url: string }>('/api/backend/proxy/subscription');
+
+export const updateBackendProxySubscription = async (url: string) =>
+  backendJson<{ ok: boolean }>('/api/backend/proxy/subscription', {
+    method: 'POST',
+    body: { url },
+  });
+
+export const fetchBackendProxyNodes = async () =>
+  backendJson<Record<string, unknown>>('/api/backend/proxy/nodes');
+
+export const selectBackendProxyNode = async (group: string, name: string) =>
+  backendJson<{ ok: boolean }>('/api/backend/proxy/select', {
+    method: 'POST',
+    body: { group, name },
+  });
+
 export const putBackendCollection = async (items: CollectionItem[]) =>
   backendJson<CollectionItem[]>('/api/backend/collection', {
     method: 'PUT',

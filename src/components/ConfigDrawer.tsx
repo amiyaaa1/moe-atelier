@@ -54,6 +54,16 @@ interface ConfigDrawerProps {
   onBackendDisable: () => void;
   onBackendAuthCancel: () => void;
   onBackendAuthConfirm: () => void;
+  proxySubscription: string;
+  proxySubscriptionLoading: boolean;
+  onProxySubscriptionChange: (value: string) => void;
+  onProxySubscriptionSave: () => void;
+  proxyNodes: { label: string; value: string }[];
+  proxyNodesLoading: boolean;
+  proxyNodeActive: string;
+  proxyNodeSelecting: boolean;
+  onProxyNodesRefresh: () => void;
+  onProxyNodeSelect: (value: string) => void;
 }
 
 const ConfigDrawer: React.FC<ConfigDrawerProps> = ({
@@ -76,6 +86,16 @@ const ConfigDrawer: React.FC<ConfigDrawerProps> = ({
   onBackendDisable,
   onBackendAuthCancel,
   onBackendAuthConfirm,
+  proxySubscription,
+  proxySubscriptionLoading,
+  onProxySubscriptionChange,
+  onProxySubscriptionSave,
+  proxyNodes,
+  proxyNodesLoading,
+  proxyNodeActive,
+  proxyNodeSelecting,
+  onProxyNodesRefresh,
+  onProxyNodeSelect,
 }) => (
   <Drawer
     title={
@@ -442,6 +462,64 @@ const ConfigDrawer: React.FC<ConfigDrawerProps> = ({
             </Space>
           </div>
         </div>
+      </div>
+
+      <div
+        style={{
+          background: '#F7F4FF',
+          padding: '16px',
+          borderRadius: 16,
+          marginBottom: 24,
+          border: '1px dashed #C4B5FD',
+        }}
+      >
+        <Form.Item label={<span style={{ fontWeight: 700, color: '#665555' }}>Clash 订阅与节点</span>} style={{ marginBottom: 12 }}>
+          <Text type="secondary" style={{ fontSize: 12, color: '#6B7280', lineHeight: 1.5, display: 'block' }}>
+            需要后端模式 + 服务端启用内置 Clash 代理内核后生效。
+          </Text>
+        </Form.Item>
+        <Space direction="vertical" size={12} style={{ width: '100%' }}>
+          <Input
+            size="large"
+            value={proxySubscription}
+            placeholder="Clash 订阅链接"
+            onChange={(e) => onProxySubscriptionChange(e.target.value)}
+            disabled={!backendMode || backendAuthPending}
+          />
+          <Space>
+            <Button
+              type="primary"
+              size="small"
+              onClick={onProxySubscriptionSave}
+              loading={proxySubscriptionLoading}
+              disabled={!backendMode || backendAuthPending}
+            >
+              保存订阅
+            </Button>
+            <Button
+              size="small"
+              onClick={onProxyNodesRefresh}
+              loading={proxyNodesLoading}
+              disabled={!backendMode || backendAuthPending}
+            >
+              刷新节点
+            </Button>
+          </Space>
+          <div>
+            <Text type="secondary" style={{ fontSize: 12, color: '#6B7280', display: 'block', marginBottom: 6 }}>
+              当前节点：{proxyNodeActive || '未选择'}
+            </Text>
+            <Select
+              style={{ width: '100%' }}
+              placeholder="选择节点"
+              options={proxyNodes}
+              value={proxyNodeActive || undefined}
+              onChange={onProxyNodeSelect}
+              loading={proxyNodesLoading || proxyNodeSelecting}
+              disabled={!backendMode || backendAuthPending}
+            />
+          </div>
+        </Space>
       </div>
 
       <div style={{ marginTop: 24, padding: 16, background: '#FFF8E1', borderRadius: 16, border: '1px dashed #FFC107' }}>
